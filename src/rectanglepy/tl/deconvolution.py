@@ -8,7 +8,7 @@ import statsmodels.api as sm
 from joblib import Parallel, delayed, parallel_backend
 from loguru import logger
 
-from rectanglepy.pp.rectangle_signature import RectangleSignatureResult
+from ..pp.rectangle_signature import RectangleSignatureResult
 
 
 def _scale_weights(weights: np.ndarray) -> np.ndarray:
