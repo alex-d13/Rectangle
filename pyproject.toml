@@ -19,7 +19,7 @@ urls.Documentation = "https://rectanglepy.readthedocs.io/"
 urls.Source = "https://github.com/ComputationalBiomedicineGroup/Rectangle"
 urls.Home-page = "https://github.com/ComputationalBiomedicineGroup/Rectangle"
 dependencies = [
-    "pydeseq2==0.4.11",
+    "pydeseq2==0.5.2",
     "scipy==1.13.0",
     "quadprog==0.1.12",
     "loguru",
