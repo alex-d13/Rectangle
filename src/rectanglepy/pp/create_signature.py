@@ -11,7 +11,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.stats import pearsonr
 from sklearn.metrics import silhouette_score
 
-from rectanglepy.tl.deconvolution import solve_qp
+from ..tl.deconvolution import solve_qp
 
 from .rectangle_signature import RectangleSignatureResult
 
@@ -127,12 +127,22 @@ def _filter_de_analysis_results(de_analysis_result, p, logfc):
 
 
 def _run_deseq2(
-    countsig: pd.DataFrame, sc_data, annotations: pd.Series, n_cpus: int = None, gene_expression_threshold=0.5
+    countsig: pd.DataFrame, sc_data, annotations: pd.Series, n_cpus: int = None, gene_expression_threshold=0.5, stratification_labels=None
 ) -> dict[str | int, pd.DataFrame]:
     results = {}
     inference = DefaultInference(n_cpus=n_cpus)
-    bootstrapped_signature = _create_bootstrap_signature(countsig, sc_data, annotations)
+    
+    # Get bootstrapped signature and metadata if stratified
+    if stratification_labels is not None:
+        bootstrapped_signature, metadata_df = _create_stratified_bootstrap_signature(
+            countsig, sc_data, annotations, stratification_labels
+        )
+    else:
+        bootstrapped_signature = _create_bootstrap_signature(countsig, sc_data, annotations, None)
+        metadata_df = pd.DataFrame({"condition": "A"}, index=bootstrapped_signature.columns)
+    
     np.random.seed(42)
+    
     for _i, cell_type in enumerate(countsig.columns):
         bootstrapped_signature_copy = bootstrapped_signature.copy()
         countsig_copy = countsig.copy()
@@ -145,27 +155,61 @@ def _run_deseq2(
         threshold = gene_expression_threshold * sc_data_filtered.shape[0]
         genes = countsig_copy.index[expressed_cells > threshold].tolist()
         bootstrapped_signature_copy = bootstrapped_signature_copy.loc[genes].T
-        logger.info(f"Running DE analysis for {cell_type}")
-        condition = ["B" if (cell_type + "_") in x else "A" for x in bootstrapped_signature_copy.index]
-        clinical_df = pd.DataFrame({"condition": condition}, index=bootstrapped_signature_copy.index)
+        
+        # Set condition based on which cell type we're testing
+        clinical_df = metadata_df.copy()
+        clinical_df["condition"] = ["B" if (cell_type + "_") in x else "A" for x in clinical_df.index]
+        
+        # Set up design formula - include stratum as covariate if stratification is used
+        if stratification_labels is not None:
+            design_formula = "~ condition + stratum"
+            logger.info(f"Running DE analysis for {cell_type} with stratification covariate.")
+        else:
+            design_formula = "~ condition"
+            logger.info(f"Running DE analysis for {cell_type}.")
+        
         dds = DeseqDataSet(
             counts=bootstrapped_signature_copy,
             metadata=clinical_df,
-            design_factors="condition",
+            design=design_formula,
             quiet=True,
             inference=inference,
-            refit_cooks=False,
+            refit_cooks=False
         )
         dds.deseq2()
-        stat_res = DeseqStats(dds, inference=inference, quiet=True, cooks_filter=False)
+        stat_res = DeseqStats(dds, inference=inference, quiet=True, cooks_filter=False, contrast=['condition','A','B'])
         stat_res.summary(quiet=True)
-        stat_res.lfc_shrink("condition_B_vs_A")
+        stat_res.lfc_shrink("condition[T.B]")
         results[cell_type] = stat_res.results_df
 
     return results
 
 
-def _create_bootstrap_signature(countsig, sc_data, annotations) -> pd.DataFrame:
+def _create_bootstrap_signature(countsig, sc_data, annotations, stratification_labels=None) -> pd.DataFrame:
+    """Create bootstrap signature with optional stratified sampling.
+    
+    Parameters
+    ----------
+    countsig : pd.DataFrame
+        Count signature matrix (genes x cell types)
+    sc_data : np.ndarray or sparse matrix
+        Single-cell count data (cells x genes)
+    annotations : pd.Series or array-like
+        Cell type annotations with same length as sc_data
+    stratification_labels : pd.Series or array-like, optional
+        Stratification group labels (e.g., patient ID, dataset).
+        If provided, performs stratified bootstrapping. If None, performs regular bootstrapping.
+        
+    Returns
+    -------
+    pd.DataFrame
+        Bootstrapped signature matrix (genes x bootstrapped samples)
+    """
+    if stratification_labels is not None:
+        sig, _ = _create_stratified_bootstrap_signature(countsig, sc_data, annotations, stratification_labels)
+        return sig
+    
+    # Non-stratified bootstrapping
     if scipy.sparse.issparse(sc_data):
         sc_data = sc_data.toarray()
     celltypes = countsig.columns
@@ -180,10 +224,109 @@ def _create_bootstrap_signature(countsig, sc_data, annotations) -> pd.DataFrame:
             summed_rows = sc_data_filtered[selected_rows].sum(axis=0)
             bootstrapped_signature[f"{celltype}_{i}"] = list(summed_rows)
     bootstrapped_signature.index = countsig.index
+
     # to int
-    samples_per_bootstrap = samples_per_bootstrap / 2.5
     bootstrapped_signature = bootstrapped_signature.astype(int)
     return bootstrapped_signature
+
+
+def _create_stratified_bootstrap_signature(
+    countsig, sc_data, annotations, stratification_labels
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Create bootstrap signature with stratified sampling across groups.
+    
+    Performs bootstrapping within each stratification group (e.g., patient, dataset)
+    separately for each cell type. Returns a signature matrix with columns for each
+    cell type AND stratification group combination, enabling stratification modeling
+    in downstream DE analysis.
+    
+    Handles cases where cell types may not be present in all stratification groups.
+    
+    Parameters
+    ----------
+    countsig : pd.DataFrame
+        Count signature matrix (genes x cell types)
+    sc_data : np.ndarray or sparse matrix
+        Single-cell count data (cells x genes)
+    annotations : pd.Series or array-like
+        Cell type annotations with same length as sc_data
+    stratification_labels : pd.Series or array-like
+        Stratification group labels (e.g., patient ID, dataset) 
+        with same length as sc_data
+        
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        - Bootstrapped signature matrix (genes x bootstrapped samples)
+          with columns named as "{celltype}_{stratum}_{bootstrap_idx}"
+        - Metadata dataframe with 'stratum' column indexed by column names
+    """
+    if scipy.sparse.issparse(sc_data):
+        sc_data = sc_data.toarray()
+    
+    celltypes = countsig.columns
+    bootstrapped_data = {}
+    metadata_strata = {}
+    number_of_bootstraps = 7
+    samples_per_bootstrap = 500
+    np.random.seed(42)
+    
+    # Convert to arrays for easier indexing
+    annotations = np.asarray(annotations)
+    stratification_labels = np.asarray(stratification_labels)
+    
+    for celltype in celltypes:
+        # Get cells of this type
+        celltype_mask = annotations == celltype
+        celltype_indices = np.where(celltype_mask)[0]
+        
+        if len(celltype_indices) == 0:
+            logger.warning(f"No cells found for cell type {celltype}")
+            continue
+        
+        # Get unique stratification groups for this cell type
+        celltype_strata = stratification_labels[celltype_indices]
+        unique_strata = np.unique(celltype_strata)
+        
+        # For each stratum, create separate bootstrap samples
+        for stratum in unique_strata:
+            # Get indices of cells in this stratum and cell type
+            stratum_celltype_mask = (annotations == celltype) & (stratification_labels == stratum)
+            stratum_celltype_indices = np.where(stratum_celltype_mask)[0]
+            
+            num_samples_stratum = len(stratum_celltype_indices)
+            
+            if num_samples_stratum == 0:
+                continue
+            
+            # Create bootstrap samples from this stratum-celltype combination
+            for i in range(number_of_bootstraps):
+                # Sample with replacement from this specific stratum
+                selected_local_rows = np.random.choice(
+                    num_samples_stratum,
+                    min(samples_per_bootstrap, num_samples_stratum),
+                    replace=True
+                )
+                selected_indices = stratum_celltype_indices[selected_local_rows]
+                
+                # Sum the selected rows
+                sc_data_filtered = sc_data.T[selected_indices]
+                summed_rows = sc_data_filtered.sum(axis=0)
+                
+                # Column name: celltype_stratum_bootstrap_index
+                col_name = f"{celltype}_{stratum}_{i}"
+                bootstrapped_data[col_name] = list(summed_rows)
+                metadata_strata[col_name] = str(stratum)
+    
+    # Create DataFrame from all columns at once
+    bootstrapped_signature = pd.DataFrame(bootstrapped_data, index=countsig.index)
+    
+    # Create metadata dataframe
+    metadata_df = pd.DataFrame({"stratum": metadata_strata}, index=bootstrapped_signature.columns)
+    
+    # to int
+    bootstrapped_signature = bootstrapped_signature.astype(int)
+    return bootstrapped_signature, metadata_df
 
 
 def _de_analysis(
@@ -194,11 +337,12 @@ def _de_analysis(
     lfc,
     optimize_cutoffs: bool,
     n_cpus: int = None,
+    stratification_labels: pd.Series = None,
     genes=None,
     gene_expression_threshold=0.5,
 ) -> tuple[Series, dict[str, [str]] :, DataFrame | None]:
     logger.info("Starting DE analysis")
-    deseq_results = _run_deseq2(pseudo_count_sig, sc_data, annotations, n_cpus, gene_expression_threshold)
+    deseq_results = _run_deseq2(pseudo_count_sig, sc_data, annotations, n_cpus, gene_expression_threshold, stratification_labels)
     optimization_results = None
 
     if optimize_cutoffs:
@@ -285,6 +429,7 @@ def build_rectangle_signatures(
     lfc=1.5,
     n_cpus: int = None,
     gene_expression_threshold=0.5,
+    stratification_column: str = None
 ) -> RectangleSignatureResult:
     r"""Builds rectangle signatures based on single-cell  count data and annotations.
 
@@ -338,11 +483,25 @@ def build_rectangle_signatures(
 
     genes = adata.var_names
 
+    if stratification_column is not None:
+        stratification_labels = adata.obs[stratification_column]
+    else:
+        stratification_labels = None
+
     pseudo_sig_counts = _create_pseudo_count_sig(sc_counts, annotations, genes)
     m_rna_biasfactors = _create_bias_factors(pseudo_sig_counts, sc_counts, annotations)
 
     marker_genes, marker_genes_per_cell_type, optimization_result = _de_analysis(
-        pseudo_sig_counts, sc_counts, annotations, p, lfc, optimize_cutoffs, n_cpus, genes, gene_expression_threshold
+        pseudo_count_sig = pseudo_sig_counts, 
+        sc_data = sc_counts, 
+        annotations = annotations, 
+        p = p, 
+        lfc = lfc, 
+        optimize_cutoffs = optimize_cutoffs, 
+        n_cpus = n_cpus, 
+        stratification_labels = stratification_labels,
+        genes = genes, 
+        gene_expression_threshold = gene_expression_threshold        
     )
     pseudo_sig_cpm = _convert_to_cpm(pseudo_sig_counts)
     logger.info("Starting rectangle cluster analysis")
@@ -362,13 +521,15 @@ def build_rectangle_signatures(
 
     clustered_biasfact = _create_bias_factors(clustered_signature, sc_counts, clustered_annotations)
     clustered_genes, clustered_marker_genes_per_cell_type, _ = _de_analysis(
-        clustered_signature,
-        sc_counts,
-        clustered_annotations,
-        p,
-        lfc,
-        False,
-        gene_expression_threshold=gene_expression_threshold,
+        pseudo_count_sig = clustered_signature,
+        sc_data = sc_counts,
+        annotations = clustered_annotations,
+        p = p,
+        lfc = lfc,
+        optimize_cutoffs = False,
+        n_cpus = n_cpus, 
+        stratification_labels = stratification_labels,
+        gene_expression_threshold = gene_expression_threshold,
     )
     clustered_signature = _convert_to_cpm(clustered_signature)
     return RectangleSignatureResult(
